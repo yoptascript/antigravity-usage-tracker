@@ -1,6 +1,9 @@
-# ag
+# antigravity-usage-tracker
 
 Small CLI for reading Antigravity logs and showing when quota opens again.
+The executable is `ag`.
+
+This repository is code-only. Local tracker state, personal logs, and machine-specific data are intentionally not committed.
 
 ## Commands
 
