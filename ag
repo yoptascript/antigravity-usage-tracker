@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+import re
+import sys
+import time
+
+LOG_DIR = Path.home() / "Library/Application Support/Antigravity/logs"
+DEFAULT_REFRESH_HOURS = 5
+TZ = ZoneInfo("Europe/Moscow")
+
+EXHAUSTED_PATTERNS = (
+    "resource_exhausted",
+    "exhausted your capacity",
+    "quota will reset after",
+)
+TIMESTAMP_RE = re.compile(
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)"
+)
+RESET_AFTER_RE = re.compile(
+    r"quota will reset after (?P<duration>(?:\d+h)?(?:\d+m)?(?:\d+s)?)",
+    re.IGNORECASE,
+)
+DURATION_RE = re.compile(r"(?:(?P<hours>\d+)h)?(?:(?P<minutes>\d+)m)?(?:(?P<seconds>\d+)s)?")
+COMMAND_DESCRIPTIONS: dict[str, str] = {
+    "next": "show the next quota reset window",
+    "watch": "watch logs for new quota exhaustion events",
+    "help": "show this help message",
+}
+
+
+@dataclass(frozen=True)
+class BurnEvent:
+    occurred_at: datetime
+    reset_at: datetime | None
+    source: Path
+
+
+def now() -> datetime:
+    return datetime.now(TZ)
+
+
+def normalize(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=TZ)
+    return dt.astimezone(TZ)
+
+
+def parse_timestamp(line: str) -> datetime | None:
+    match = TIMESTAMP_RE.search(line)
+    if match is None:
+        return None
+    return normalize(datetime.fromisoformat(match.group("timestamp")))
+
+
+def parse_reset_delta(line: str) -> timedelta | None:
+    match = RESET_AFTER_RE.search(line)
+    if match is None:
+        return None
+
+    duration_text = match.group("duration")
+    duration_match = DURATION_RE.fullmatch(duration_text)
+    if duration_match is None:
+        return None
+
+    hours = int(duration_match.group("hours") or 0)
+    minutes = int(duration_match.group("minutes") or 0)
+    seconds = int(duration_match.group("seconds") or 0)
+    if hours == 0 and minutes == 0 and seconds == 0:
+        return None
+
+    return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
+def parse_burn_event(line: str, source: Path) -> BurnEvent | None:
+    lower_line = line.lower()
+    if not any(pattern in lower_line for pattern in EXHAUSTED_PATTERNS):
+        return None
+
+    occurred_at = parse_timestamp(line)
+    if occurred_at is None:
+        return None
+
+    reset_delta = parse_reset_delta(line)
+    reset_at = occurred_at + reset_delta if reset_delta is not None else None
+    return BurnEvent(occurred_at=occurred_at, reset_at=reset_at, source=source)
+
+
+def recent_log_files(limit: int = 25) -> list[Path]:
+    if not LOG_DIR.exists():
+        return []
+    files = sorted(LOG_DIR.rglob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return files[:limit]
+
+
+def detect_last_burn() -> BurnEvent | None:
+    for file_path in recent_log_files():
+        try:
+            lines = file_path.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+
+        for line in reversed(lines):
+            event = parse_burn_event(line, file_path)
+            if event is not None:
+                return event
+
+    return None
+
+
+def format_delta(delta: timedelta) -> str:
+    return str(delta).split(".", maxsplit=1)[0]
+
+
+def print_help() -> None:
+    print("Usage: ag [command]")
+    print("")
+    print("Commands:")
+    for command, description in COMMAND_DESCRIPTIONS.items():
+        print(f"  {command:<5} {description}")
+
+
+def next_window() -> int:
+    event = detect_last_burn()
+    if event is None:
+        print("⚠️ No rate-limit detected yet.")
+        print("Use Antigravity until you hit limit once.")
+        return 1
+
+    next_time = event.reset_at or (event.occurred_at + timedelta(hours=DEFAULT_REFRESH_HOURS))
+    current = now()
+
+    print(f"🧠 Last detected burn: {event.occurred_at.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"📄 Source: {event.source}")
+    print(f"⏳ Next window: {next_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+    delta = next_time - current
+    if delta.total_seconds() > 0:
+        print(f"⌛ Time remaining: {format_delta(delta)}")
+        if delta.total_seconds() < 600:
+            print("⚡ Window opening soon")
+        return 0
+
+    print("✅ Window is OPEN — go burn")
+    return 0
+
+
+def watch() -> int:
+    print("👁️ Watching for rate limit... (Ctrl+C to stop)\n")
+
+    last_seen: BurnEvent | None = None
+    try:
+        while True:
+            detected = detect_last_burn()
+            if detected is not None and detected != last_seen:
+                print(f"\n🔥 NEW BURN DETECTED: {detected.occurred_at.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                if detected.reset_at is not None:
+                    print(f"⏳ Next window: {detected.reset_at.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                print(f"📄 Source: {detected.source}")
+                last_seen = detected
+            time.sleep(10)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print_help()
+        return 1
+
+    cmd = sys.argv[1]
+    if cmd in {"help", "-h", "--help"}:
+        print_help()
+        return 0
+    if cmd == "next":
+        return next_window()
+    if cmd == "watch":
+        return watch()
+
+    print("Unknown command")
+    print("")
+    print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
